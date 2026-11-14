@@ -151,7 +151,8 @@ The data (NEREL), model weights and archives are not included in the repository.
 ## Reproduction
 ```bash
 pip install -r requirements.txt
-# Data: download NEREL v1.1 (https://github.com/nerel-ds/NEREL) and put the train and dev folders
+
+# Data: download NEREL v1.1 (https://github.com/nerel-ds/NEREL/tree/master/NEREL-v1.1) and put the train and dev folders
 # (*.txt and *.ann files) into data/train and data/dev. Do not use the test folder for training.
 
 # CRF: tune on dev, then train the final model on train+dev
@@ -171,3 +172,4 @@ Keep the project path ASCII-only.
 ## Data and licences
 The NEREL corpus is distributed by its authors (https://github.com/nerel-ds/NEREL/tree/master/NEREL-v1.1); see their page for the terms of use.
 The pretrained model is `cointegrated/rubert-tiny2` on Hugging Face; check the licence on the model page.
+
