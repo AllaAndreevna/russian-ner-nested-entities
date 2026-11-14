@@ -1,0 +1,17 @@
+# окружение и кэш
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.vscode/
+
+# данные (NEREL скачивается отдельно)
+data/
+
+# артефакты обучения и архивы для отправки
+*.crfsuite
+*.pt
+*.zip
+bert_meta.json
+bert_tokenizer.json
+rubert-tiny2/
