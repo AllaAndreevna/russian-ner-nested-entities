@@ -111,7 +111,7 @@ requirements.txt
 ## Воспроизведение
 ```bash
 pip install -r requirements.txt
-# Данные: скачать NEREL v1.1 (https://github.com/nerel-ds/NEREL), положить папки train и dev
+# Данные: скачать NEREL v1.1 ([https://github.com/nerel-ds/NEREL](https://github.com/nerel-ds/NEREL/tree/master/NEREL-v1.1)), положить папки train и dev
 # (файлы *.txt и *.ann) в data/train и data/dev. Папку test для обучения не использовать.
 
 # CRF: подбор на dev, затем финальная модель на train+dev
