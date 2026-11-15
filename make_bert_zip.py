@@ -21,6 +21,7 @@ FILES = [
     ("train.py", "training/train.py"),
     ("solution.py", "training/solution.py"),
     ("check_submission.py", "training/check_submission.py"),
+    ("diagnose_vocab.py", "training/diagnose_vocab.py"),
 ]
 
 missing = [src for src, _ in FILES if not os.path.exists(src)]

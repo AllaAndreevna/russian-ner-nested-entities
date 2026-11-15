@@ -1,4 +1,4 @@
-"""NER на основе дообученного rubert-tiny2 (обрезанный словарь, слои вложенности).
+"""NER на основе дообученного rubert-tiny2 (слои вложенности, сжатые эмбеддинги).
 
 В архиве для проверяющей системы этот файл кладётся как solution.py
 (см. make_bert_zip.py). Артефакты обучения лежат рядом с ним:
@@ -22,6 +22,23 @@ TOKENIZER_FILE = os.path.join(BASE_DIR, "bert_tokenizer.json")
 MAX_LEN = 512      # позиций у обрезанной модели (вместе с [CLS] и [SEP])
 MAX_WORDS = 80     # слов в одном куске предложения
 NUM_THREADS = 4    # ограничение потоков для torch
+CASE_CLASSES = 7   # 0 - служебные токены, 1..6 - см. case_class
+
+
+def case_class(w: str) -> int:
+    """Регистр слова: токенизатор rubert-tiny2 приводит текст к нижнему регистру
+    и теряет важный для NER признак - заглавную букву. Возвращаем его отдельно."""
+    if any(ch.isdigit() for ch in w):
+        return 4
+    if not any(ch.isalpha() for ch in w):
+        return 5
+    if w.isupper() and len(w) > 1:
+        return 3
+    if w.istitle():
+        return 2
+    if w.islower():
+        return 1
+    return 6
 
 
 # ---------- токенизация и декодирование (те же, что в CRF-версии) ----------
@@ -59,7 +76,7 @@ def decode(tokens, tags) -> Set[Tuple[int, int, str]]:
     return ents
 
 
-# ---------- кодирование слов в id обрезанного словаря ----------
+# ---------- кодирование слов в id (возможно, обрезанного) словаря ----------
 
 class Encoder:
     """Токенизатор исходной модели + отображение старых id в компактные.
@@ -79,20 +96,29 @@ class Encoder:
             self.id_map[old] = new
 
     def encode(self, words):
-        """-> (ids с [CLS]/[SEP], позиция первого подтокена каждого слова или None)."""
+        """-> (ids с [CLS]/[SEP], позиция первого подтокена каждого слова или None,
+        класс регистра для каждой позиции)."""
         enc = self.tok.encode(words, is_pretokenized=True)
         ids = self.id_map[np.asarray(enc.ids, dtype=np.int64)].tolist()
+        word_case = [case_class(w) for w in words]
         first = [None] * len(words)
+        case = []
         for pos, w in enumerate(enc.word_ids):
-            if w is not None and first[w] is None:
-                first[w] = pos
+            if w is None:
+                case.append(0)
+            else:
+                case.append(word_case[w])
+                if first[w] is None:
+                    first[w] = pos
         if len(ids) > MAX_LEN:  # страховка от патологически длинных слов
             ids = ids[: MAX_LEN - 1] + ids[-1:]
+            case = case[: MAX_LEN - 1] + case[-1:]
             first = [p if p is not None and p < MAX_LEN - 1 else None for p in first]
-        return ids, first
+        return ids, first, case
 
     def chunks(self, words):
-        """Режет предложение на куски, влезающие в MAX_LEN: [(lo, hi, (ids, first))]."""
+        """Режет предложение на куски, влезающие в MAX_LEN:
+        [(lo, hi, (ids, first, case))]."""
         out = []
 
         def rec(lo, hi):
@@ -111,21 +137,78 @@ class Encoder:
 
 # ---------- модель ----------
 
-class NestedBertNER(torch.nn.Module):
-    """Общий энкодер и по одной классификационной "голове" на каждый слой вложенности."""
+class TokenEmbedding(torch.nn.Module):
+    """Эмбеддинги токенов: полные (V x H) или низкоранговые (V x r) @ (r x H)."""
 
-    def __init__(self, config, n_layers, n_labels):
+    def __init__(self, vocab_size, hidden, rank=0):
         super().__init__()
+        self.rank = rank
+        if rank:
+            self.A = torch.nn.Embedding(vocab_size, rank)
+            self.B = torch.nn.Linear(rank, hidden, bias=False)
+        else:
+            self.E = torch.nn.Embedding(vocab_size, hidden)
+
+    def forward(self, ids):
+        if self.rank:
+            return self.B(self.A(ids))
+        return self.E(ids)
+
+
+class NestedBertNER(torch.nn.Module):
+    """Общий энкодер и по одной классификационной "голове" на каждый слой вложенности.
+    Эмбеддинги токенов (и, по желанию, регистра) считаются снаружи BertModel
+    и подаются как inputs_embeds."""
+
+    def __init__(self, config, n_layers, n_labels, emb_rank=0, use_case=False):
+        super().__init__()
+        hidden = config.hidden_size
         self.bert = BertModel(config, add_pooling_layer=False)
+        # встроенные эмбеддинги слов заменяем заглушкой: используются свои (tok_emb)
+        self.bert.embeddings.word_embeddings = torch.nn.Embedding(1, hidden)
+        self.tok_emb = TokenEmbedding(config.vocab_size, hidden, emb_rank)
+        self.case_emb = None
+        if use_case:
+            self.case_emb = torch.nn.Embedding(CASE_CLASSES, hidden, padding_idx=0)
+            torch.nn.init.normal_(self.case_emb.weight, std=0.02)
+            with torch.no_grad():
+                self.case_emb.weight[0].zero_()
         self.drop = torch.nn.Dropout(0.1)
         self.heads = torch.nn.ModuleList(
-            [torch.nn.Linear(config.hidden_size, n_labels) for _ in range(n_layers)]
+            [torch.nn.Linear(hidden, n_labels) for _ in range(n_layers)]
         )
 
-    def forward(self, input_ids, attention_mask):
-        h = self.bert(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+    def forward(self, input_ids, attention_mask, case_ids=None):
+        emb = self.tok_emb(input_ids)
+        if self.case_emb is not None:
+            emb = emb + self.case_emb(case_ids)
+        h = self.bert(inputs_embeds=emb, attention_mask=attention_mask).last_hidden_state
         h = self.drop(h)
         return torch.stack([head(h) for head in self.heads], dim=0)  # [K, B, T, L]
+
+
+def build_model(meta):
+    return NestedBertNER(
+        BertConfig(**meta["bert_config"]),
+        meta["num_layers"],
+        len(meta["labels"]),
+        emb_rank=meta.get("emb_rank", 0),
+        use_case=meta.get("use_case", False),
+    )
+
+
+def dequantize(state):
+    """Восстанавливает float-веса; матрицы эмбеддингов могут храниться как int8 + масштаб по строкам."""
+    out = {}
+    for k, v in state.items():
+        if k.endswith("__int8"):
+            base = k[: -len("__int8")]
+            out[base] = v.float() * state[base + "__scale"].float()
+        elif k.endswith("__scale"):
+            continue
+        else:
+            out[k] = v.float()
+    return out
 
 
 @torch.inference_mode()
@@ -139,21 +222,24 @@ def predict_texts(model, encoder, labels, texts, batch_size=64):
             sid = len(sents)
             sents.append((ti, toks))
             tags_store.append([["O"] * len(toks) for _ in range(n_layers)])
-            for lo, hi, (ids, first) in encoder.chunks([t[2] for t in toks]):
-                items.append((sid, lo, hi, ids, first))
+            for lo, hi, (ids, first, case) in encoder.chunks([t[2] for t in toks]):
+                items.append((sid, lo, hi, ids, first, case))
 
     order = sorted(range(len(items)), key=lambda i: len(items[i][3]))
     for b in range(0, len(order), batch_size):
         batch = [items[i] for i in order[b : b + batch_size]]
         width = max(len(it[3]) for it in batch)
         ids = torch.full((len(batch), width), encoder.pad_id, dtype=torch.long)
+        case_t = torch.zeros((len(batch), width), dtype=torch.long)
         mask = torch.zeros((len(batch), width), dtype=torch.long)
         for bi, it in enumerate(batch):
             n = len(it[3])
             ids[bi, :n] = torch.tensor(it[3], dtype=torch.long)
+            case_t[bi, :n] = torch.tensor(it[5], dtype=torch.long)
             mask[bi, :n] = 1
-        pred = model(ids.to(device), mask.to(device)).argmax(-1).cpu().tolist()  # [K][B][T]
-        for bi, (sid, lo, hi, _, first) in enumerate(batch):
+        logits = model(ids.to(device), mask.to(device), case_t.to(device))
+        pred = logits.argmax(-1).cpu().tolist()  # [K][B][T]
+        for bi, (sid, lo, hi, _, first, _) in enumerate(batch):
             for w in range(hi - lo):
                 pos = first[w]
                 if pos is None:
@@ -177,13 +263,9 @@ class Solution:
             meta = json.load(f)
         self.labels = meta["labels"]
         self.encoder = Encoder(TOKENIZER_FILE, meta["kept_ids"])
-        self.model = NestedBertNER(
-            BertConfig(**meta["bert_config"]), meta["num_layers"], len(self.labels)
-        )
-        state = torch.load(MODEL_FILE, map_location="cpu")
-        missing, unexpected = self.model.load_state_dict(
-            {k: v.float() for k, v in state.items()}, strict=False
-        )
+        self.model = build_model(meta)
+        state = dequantize(torch.load(MODEL_FILE, map_location="cpu"))
+        missing, unexpected = self.model.load_state_dict(state, strict=False)
         bad = [k for k in list(missing) + list(unexpected)
                if "position_ids" not in k and "token_type_ids" not in k]
         if bad:
